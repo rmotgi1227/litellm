@@ -237,7 +237,14 @@ class OpenTelemetry(CustomLogger):
             not isinstance(cb, OpenTelemetry) for cb in litellm.service_callback
         ):
             litellm.service_callback.append(self)
-        setattr(proxy_server, "open_telemetry_logger", self)
+        # avoid proxy logger ownership being overwritten by later
+        # handlers. Multiple integrations (default OTEL, Langfuse OTEL,
+        # Arize OTEL, etc.) may initialize in sequence; without this guard,
+        # the last one silently replaces the first and breaks expected
+        # routing for proxy_server.open_telemetry_logger consumers.
+        # Behavior: first-registered wins.
+        if getattr(proxy_server, "open_telemetry_logger", None) is None:
+            setattr(proxy_server, "open_telemetry_logger", self)
 
     def _get_or_create_provider(
         self,
@@ -794,12 +801,109 @@ class OpenTelemetry(CustomLogger):
     # End of Team/Key Based Logging Control Flow
     #########################################################
 
+    def _get_span_dedupe_key(self, kind: str) -> str:
+        """Stable per-handler key used to deduplicate span emission for an outcome.
+
+        Each OpenTelemetry handler instance maintains its own slot in the
+        request-local idempotency dict, separately for each outcome
+        (``"success"`` / ``"failure"``). This lets multiple OTEL integrations
+        (e.g. default OTEL + Langfuse OTEL) each emit exactly one span per
+        request, while suppressing duplicate emissions from the same handler
+        firing on both the sync and async callback paths.
+        """
+        return f"{self.__class__.__name__}:{id(self)}:{kind}"
+
+    def _get_success_dedupe_key(self) -> str:
+        return self._get_span_dedupe_key("success")
+
+    def _get_failure_dedupe_key(self) -> str:
+        return self._get_span_dedupe_key("failure")
+
+    def _mark_span_once(self, kwargs: dict, kind: str) -> bool:
+        """Record that this handler has emitted a ``kind`` span for this request.
+
+        Returns True the first time the handler observes this request for
+        ``kind``, and False on subsequent calls — signaling the caller to
+        skip duplicate span writes.
+        """
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+            kwargs["litellm_params"] = litellm_params
+
+        _metadata = litellm_params.get("metadata")
+        if not isinstance(_metadata, dict):
+            _metadata = {}
+            litellm_params["metadata"] = _metadata
+
+        _otel_internal = _metadata.get("_otel_internal")
+        if not isinstance(_otel_internal, dict):
+            _otel_internal = {}
+            _metadata["_otel_internal"] = _otel_internal
+
+        spans_logged = _otel_internal.get("spans_logged")
+        if not isinstance(spans_logged, dict):
+            spans_logged = {}
+            _otel_internal["spans_logged"] = spans_logged
+
+        dedupe_key = self._get_span_dedupe_key(kind)
+        if spans_logged.get(dedupe_key) is True:
+            return False
+
+        spans_logged[dedupe_key] = True
+        return True
+
+    def _mark_success_span_once(self, kwargs: dict) -> bool:
+        return self._mark_span_once(kwargs, "success")
+
+    def _mark_failure_span_once(self, kwargs: dict) -> bool:
+        return self._mark_span_once(kwargs, "failure")
+
+    def _end_proxy_span_from_kwargs(self, kwargs: dict, end_time) -> None:
+        """Close the proxy-level parent span if it is still recording.
+
+        This helper retrieves the proxy span directly from kwargs metadata
+        and closes it after all child spans have been recorded.
+
+        Only called from the success path. The failure path deliberately
+        leaves the proxy span open so ``async_post_call_failure_hook`` can
+        append the ``"Failed Proxy Server Request"`` child span before
+        closing it.
+
+        Only spans named ``LITELLM_PROXY_REQUEST_SPAN_NAME`` are closed —
+        externally provided spans must not be closed by LiteLLM.
+        """
+        litellm_params = kwargs.get("litellm_params", {}) or {}
+        _metadata = litellm_params.get("metadata", {}) or {}
+        proxy_span = _metadata.get("litellm_parent_otel_span", None)
+        if (
+            proxy_span is not None
+            and getattr(proxy_span, "name", None) == LITELLM_PROXY_REQUEST_SPAN_NAME
+            and hasattr(proxy_span, "is_recording")
+            and proxy_span.is_recording()
+        ):
+            proxy_span.end(end_time=self._to_ns(end_time))
+
     def _handle_success(self, kwargs, response_obj, start_time, end_time):
+        """Create the litellm_request span then close the proxy span."""
         verbose_logger.debug(
             "OpenTelemetry Logger: Logging kwargs: %s, OTEL config settings=%s",
             kwargs,
             self.config,
         )
+
+        # sync + async success handlers can both fire for one
+        # request (notably in streaming code paths). Guard against duplicate
+        # span writes — but still close the proxy span on the skip path so
+        # the trace doesn't leak an open root span.
+        if not self._mark_success_span_once(kwargs):
+            verbose_logger.debug(
+                "OpenTelemetry: skipping duplicate success span for handler=%s",
+                self._get_success_dedupe_key(),
+            )
+            self._end_proxy_span_from_kwargs(kwargs, end_time)
+            return
+
         ctx, parent_span = self._get_span_context(kwargs)
 
         if self.config.ignore_context_propagation:
@@ -859,13 +963,18 @@ class OpenTelemetry(CustomLogger):
 
         # 6. Do NOT end parent span - it should be managed by its creator
         # External spans (from Langfuse, user code, HTTP headers, global context) must not be closed by LiteLLM
-        # However, proxy-created spans should be closed here
+        # However, proxy-created spans should be closed here.
         if (
             parent_span is not None
             and hasattr(parent_span, "name")
             and parent_span.name == LITELLM_PROXY_REQUEST_SPAN_NAME
         ):
             parent_span.end(end_time=self._to_ns(end_time))
+
+        # close the proxy span explicitly from kwargs metadata
+        # after all child spans (litellm_request, guardrail, raw_request)
+        # have been fully recorded and exported.
+        self._end_proxy_span_from_kwargs(kwargs, end_time)
 
     def _start_primary_span(
         self,
@@ -1349,6 +1458,21 @@ class OpenTelemetry(CustomLogger):
             kwargs,
             self.config,
         )
+
+        # sync + async failure handlers can both fire for one
+        # request (notably in streaming code paths), producing two
+        # semantically identical ERROR spans. Unlike the success path, the
+        # proxy span is intentionally left open here so that
+        # ``async_post_call_failure_hook`` can append the
+        # "Failed Proxy Server Request" child span before closing it —
+        # there is no proxy-span side-effect to preserve on the skip path.
+        if not self._mark_failure_span_once(kwargs):
+            verbose_logger.debug(
+                "OpenTelemetry: skipping duplicate failure span for handler=%s",
+                self._get_failure_dedupe_key(),
+            )
+            return
+
         _parent_context, parent_otel_span = self._get_span_context(kwargs)
 
         if self.config.ignore_context_propagation:
@@ -2188,7 +2312,7 @@ class OpenTelemetry(CustomLogger):
             verbose_logger.debug(
                 "OpenTelemetry: Using explicit parent span from metadata"
             )
-            return trace.set_span_in_context(parent_otel_span), parent_otel_span
+            return trace.set_span_in_context(parent_otel_span), None
 
         # Priority 2: HTTP traceparent header
         if traceparent is not None:
